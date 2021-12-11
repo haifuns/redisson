@@ -134,6 +134,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
             return;
         }
         
+        // 每10秒钟执行一次
         Timeout task = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
             @Override
             public void run(Timeout timeout) throws Exception {
@@ -155,9 +156,11 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
                     }
                     
                     if (res) {
+                        // 如果锁过期时间被更新了，就重新定义一个任务
                         // reschedule itself
                         renewExpiration();
                     } else {
+                        // 如果锁过期时间更新失败，说明锁已经释放了，释放任务
                         cancelExpirationRenewal(null);
                     }
                 });
@@ -185,6 +188,8 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
     }
 
     protected RFuture<Boolean> renewExpirationAsync(long threadId) {
+        // 维持锁lua
+        // 如果lock key存在managerId:threadId这个field，就更新锁过期时间
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
                         "redis.call('pexpire', KEYS[1], ARGV[1]); " +

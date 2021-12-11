@@ -55,6 +55,7 @@ public class RedissonLock extends RedissonBaseLock {
     public RedissonLock(CommandAsyncExecutor commandExecutor, String name) {
         super(commandExecutor, name);
         this.commandExecutor = commandExecutor;
+        // 根据配置获取watchdog过期时间，默认30秒
         this.internalLockLeaseTime = commandExecutor.getConnectionManager().getCfg().getLockWatchdogTimeout();
         this.pubSub = commandExecutor.getConnectionManager().getSubscribeService().getLockPubSub();
     }
@@ -174,6 +175,7 @@ public class RedissonLock extends RedissonBaseLock {
         if (leaseTime != -1) {
             ttlRemainingFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
         } else {
+            // #lock加锁真实处理逻辑
             ttlRemainingFuture = tryLockInnerAsync(waitTime, internalLockLeaseTime,
                     TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
         }
@@ -187,6 +189,7 @@ public class RedissonLock extends RedissonBaseLock {
                 if (leaseTime != -1) {
                     internalLockLeaseTime = unit.toMillis(leaseTime);
                 } else {
+                    // 加锁成功后维持锁定时任务
                     scheduleExpirationRenewal(threadId);
                 }
             }
@@ -200,6 +203,13 @@ public class RedissonLock extends RedissonBaseLock {
     }
 
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
+        // 使用lua脚本加锁
+        // KEYS[1] getLock指定的key，作为redis hash key
+        // ARGV[1] LockWatchdogTimeout，默认过期时间，30s
+        // ARGV[2] ConnectionManagerId:threadId uuid:threadId，作为redis field key
+        // 如果hash key不存在，新增hash {key:{uuid:threadId:1}}，过期时间默认30s，返回空
+        // 如果hash key.uuid:threadId存在，给field uuid:threadId的值加1，更新过期时间，返回空
+        // 如果hash key存在，并且uuid:threadId不存在，说明已经被其他线程锁定，返回key过期时间
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
                 "if (redis.call('exists', KEYS[1]) == 0) then " +
                         "redis.call('hincrby', KEYS[1], ARGV[2], 1); " +
