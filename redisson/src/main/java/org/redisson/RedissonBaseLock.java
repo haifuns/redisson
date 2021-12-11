@@ -173,6 +173,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
     protected void scheduleExpirationRenewal(long threadId) {
         ExpirationEntry entry = new ExpirationEntry();
         ExpirationEntry oldEntry = EXPIRATION_RENEWAL_MAP.putIfAbsent(getEntryName(), entry);
+         // 如果当前锁没有续期任务就创建，如果已经存在就更新一下线程id
         if (oldEntry != null) {
             oldEntry.addThreadId(threadId);
         } else {

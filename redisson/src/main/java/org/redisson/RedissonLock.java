@@ -96,11 +96,13 @@ public class RedissonLock extends RedissonBaseLock {
     private void lock(long leaseTime, TimeUnit unit, boolean interruptibly) throws InterruptedException {
         long threadId = Thread.currentThread().getId();
         Long ttl = tryAcquire(-1, leaseTime, unit, threadId);
+        // 获取成功
         // lock acquired
         if (ttl == null) {
             return;
         }
 
+        // 订阅解锁的消息
         RFuture<RedissonLockEntry> future = subscribe(threadId);
         if (interruptibly) {
             commandExecutor.syncSubscriptionInterrupted(future);
@@ -109,6 +111,7 @@ public class RedissonLock extends RedissonBaseLock {
         }
 
         try {
+            // 获取锁失败就循环重试
             while (true) {
                 ttl = tryAcquire(-1, leaseTime, unit, threadId);
                 // lock acquired
@@ -119,6 +122,7 @@ public class RedissonLock extends RedissonBaseLock {
                 // waiting for message
                 if (ttl >= 0) {
                     try {
+                        // 等待解锁继续执行，超时时间为当前锁ttl
                         future.getNow().getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                     } catch (InterruptedException e) {
                         if (interruptibly) {
@@ -135,6 +139,7 @@ public class RedissonLock extends RedissonBaseLock {
                 }
             }
         } finally {
+            // 取消订阅锁状态消息
             unsubscribe(future, threadId);
         }
 //        get(lockAsync(leaseTime, unit));
@@ -230,12 +235,14 @@ public class RedissonLock extends RedissonBaseLock {
         long time = unit.toMillis(waitTime);
         long current = System.currentTimeMillis();
         long threadId = Thread.currentThread().getId();
+        // 直接加锁，没有watchdog机制
         Long ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
         // lock acquired
         if (ttl == null) {
             return true;
         }
         
+        // 如果超时直接返回
         time -= System.currentTimeMillis() - current;
         if (time <= 0) {
             acquireFailed(waitTime, unit, threadId);
@@ -244,6 +251,8 @@ public class RedissonLock extends RedissonBaseLock {
         
         current = System.currentTimeMillis();
         RFuture<RedissonLockEntry> subscribeFuture = subscribe(threadId);
+
+        // 设置最大等待时间，如果指定时间没有收到解锁状态变更直接超时返回
         if (!subscribeFuture.await(time, TimeUnit.MILLISECONDS)) {
             if (!subscribeFuture.cancel(false)) {
                 subscribeFuture.onComplete((res, e) -> {
@@ -256,6 +265,7 @@ public class RedissonLock extends RedissonBaseLock {
             return false;
         }
 
+        // 如果收到解锁消息就继续重试
         try {
             time -= System.currentTimeMillis() - current;
             if (time <= 0) {
@@ -352,6 +362,10 @@ public class RedissonLock extends RedissonBaseLock {
     }
 
     protected RFuture<Boolean> unlockInnerAsync(long threadId) {
+        // 如果lock key.thread不存在，直接返回空
+        // 如果lock key.thread存在，就把value先减1
+        //      如果值大于0，说明不可以释放，重置过期时间返回0
+        //      否则，说明可以解锁了，删除锁，向redisson_lock__channe:{lockkey}发布一条内容为0的消息，返回1
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "if (redis.call('hexists', KEYS[1], ARGV[3]) == 0) then " +
                         "return nil;" +
