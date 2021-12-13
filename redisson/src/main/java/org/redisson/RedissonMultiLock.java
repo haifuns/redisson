@@ -275,6 +275,7 @@ public class RedissonMultiLock implements RLock {
 
     @Override
     public void lockInterruptibly(long leaseTime, TimeUnit unit) throws InterruptedException {
+        // 默认等待时间为每个锁1.5秒
         long baseWaitTime = locks.size() * 1500;
         long waitTime = -1;
         if (leaseTime == -1) {
@@ -369,7 +370,9 @@ public class RedissonMultiLock implements RLock {
         long lockWaitTime = calcLockWaitTime(remainTime);
         
         int failedLocksLimit = failedLocksLimit();
+        // 成功加锁集合
         List<RLock> acquiredLocks = new ArrayList<>(locks.size());
+        // 遍历所有锁，挨个执行加锁
         for (ListIterator<RLock> iterator = locks.listIterator(); iterator.hasNext();) {
             RLock lock = iterator.next();
             boolean lockAcquired;
@@ -377,6 +380,7 @@ public class RedissonMultiLock implements RLock {
                 if (waitTime == -1 && leaseTime == -1) {
                     lockAcquired = lock.tryLock();
                 } else {
+                    // 默认超时时间为锁个数 * 1.5秒，默认不过期
                     long awaitTime = Math.min(lockWaitTime, remainTime);
                     lockAcquired = lock.tryLock(awaitTime, newLeaseTime, TimeUnit.MILLISECONDS);
                 }
@@ -388,13 +392,16 @@ public class RedissonMultiLock implements RLock {
             }
             
             if (lockAcquired) {
+                // 加锁成功添加到成功集合
                 acquiredLocks.add(lock);
             } else {
                 if (locks.size() - acquiredLocks.size() == failedLocksLimit()) {
                     break;
                 }
 
+                // 如果不允许失败，并且当前加锁失败了
                 if (failedLocksLimit == 0) {
+                    // 把所有加锁成功的锁解锁
                     unlockInner(acquiredLocks);
                     if (waitTime == -1) {
                         return false;
@@ -411,8 +418,11 @@ public class RedissonMultiLock implements RLock {
             }
             
             if (remainTime != -1) {
+                // 整个联锁超时时间 = 锁个数 * 1.5秒 - 当前加锁耗费时间
                 remainTime -= System.currentTimeMillis() - time;
                 time = System.currentTimeMillis();
+
+                // 如果超时，解锁已经加成功的锁，返回失败
                 if (remainTime <= 0) {
                     unlockInner(acquiredLocks);
                     return false;
@@ -457,6 +467,7 @@ public class RedissonMultiLock implements RLock {
     public void unlock() {
         List<RFuture<Void>> futures = new ArrayList<>(locks.size());
 
+        // 循环解锁，同步等待解锁完成后结束
         for (RLock lock : locks) {
             futures.add(lock.unlockAsync());
         }
