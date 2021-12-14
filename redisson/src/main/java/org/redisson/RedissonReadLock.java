@@ -56,6 +56,11 @@ public class RedissonReadLock extends RedissonLock implements RLock {
     @Override
     <T> RFuture<T> tryLockInnerAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId, RedisStrictCommand<T> command) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, command,
+                                // 读锁情况锁结构
+                                // 1. 两个线程加读锁，"lock1": {"mode": "read", "uuid1:thread1": 1, "uuid1:thread1": 1}
+                                // 2. 同一个线程重入加读锁，"lock1": {"mode": "read", "uuid1:thread1": 1, "uuid1:thread1": 2}
+                                // 3. 同一个线程先加写锁后加读锁 **，"lock1": {"mode": "read", "uuid1:thread1": 1, "uuid1:thread1:write": 1}
+
                                 // hash key=lock name 锁名，field=mode 锁模式
                                 "local mode = redis.call('hget', KEYS[1], 'mode'); " +
                                 // 如果模式为空，说明没有加过读写锁
@@ -64,20 +69,21 @@ public class RedissonReadLock extends RedissonLock implements RLock {
                                   "redis.call('hset', KEYS[1], 'mode', 'read'); " +
                                   // 新增锁，hash key=lock name，field=uuid:threadId，value=1
                                   "redis.call('hset', KEYS[1], ARGV[2], 1); " +
-                                  // 新增一个值 key={lock name}:uuid:threadId:rwlock_timeout:1，value=1
+                                  // 新增一个读锁标记 key={lock name}:uuid:threadId:rwlock_timeout:1，value=1
                                   "redis.call('set', KEYS[2] .. ':1', 1); " +
                                   // 设置过期时间，默认30秒
                                   "redis.call('pexpire', KEYS[2] .. ':1', ARGV[1]); " +
                                   "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                                   "return nil; " +
                                 "end; " +
-                                // 如果是读锁模式，或者是写锁并且field uuid:threadId:write值为1
+                                // 如果是读锁模式，或者是当前线程加的写锁
                                 "if (mode == 'read') or (mode == 'write' and redis.call('hexists', KEYS[1], ARGV[3]) == 1) then " +
                                   // 重入锁，field=uuid:threadId，值加1
+                                  // 这里hash key是可以设置多个lock field，也就是可以加多个读锁
                                   "local ind = redis.call('hincrby', KEYS[1], ARGV[2], 1); " + 
                                   // {lock name}:uuid:threadId:rwlock_timeout:锁重入次数
                                   "local key = KEYS[2] .. ':' .. ind;" +
-                                  // todo ?
+                                  // 设置重入标记 {lock name}:uuid:threadId:rwlock_timeout:当前重入次数
                                   "redis.call('set', key, 1); " +
                                   "redis.call('pexpire', key, ARGV[1]); " +
                                   "local remainTime = redis.call('pttl', KEYS[1]); " +
@@ -114,7 +120,7 @@ public class RedissonReadLock extends RedissonLock implements RLock {
                 // 重入次数 - 1
                 "local counter = redis.call('hincrby', KEYS[1], ARGV[2], -1); " + 
                 "if (counter == 0) then " +
-                    // 如果解锁前只重入了一次，说明可以解锁了，直接删除
+                    // 如果解锁前只重入了一次，说明可以解锁了，直接删除field
                     "redis.call('hdel', KEYS[1], ARGV[2]); " + 
                 "end;" +
                 // 删除标记 {lock name}:uuid:threadId:rwlock_timeout:最后一次重入
@@ -126,7 +132,7 @@ public class RedissonReadLock extends RedissonLock implements RLock {
                     // 获得hash key = lock name所有field
                     "local keys = redis.call('hkeys', KEYS[1]); " + 
                     "for n, key in ipairs(keys) do " + 
-                        // 遍历field，todo，现在看就是在找field = uuid:threadId，得到重入次数
+                        // 遍历field，就是在找field = uuid:threadId，得到重入次数
                         "counter = tonumber(redis.call('hget', KEYS[1], key)); " + 
                         "if type(counter) == 'number' then " + 
                             "for i=counter, 1, -1 do " + 
@@ -140,7 +146,7 @@ public class RedissonReadLock extends RedissonLock implements RLock {
                             
                     // 如果所有重入标记最大超时时间大于0，说明锁还有重入次数
                     "if maxRemainTime > 0 then " +
-                        // 就把过期时间设置给锁，todo 为啥？
+                        // 把标记的最大过期时间设置给锁
                         "redis.call('pexpire', KEYS[1], maxRemainTime); " +
                         "return 0; " +
                     "end;" + 
@@ -157,7 +163,7 @@ public class RedissonReadLock extends RedissonLock implements RLock {
                 "return 1; ",
                 // key[1] lock name，key[2] redisson_rwlock:{lock name}，key[3] {lock name}:uuid:threadId:rwlock_timeout，key[4] {lock name}:uuid:threadId
                 Arrays.<Object>asList(getRawName(), getChannelName(), timeoutPrefix, keyPrefix),
-                // ARGV[1] 解锁消息通道，ARGV[2]，uuid:threadId
+                // ARGV[1] 解锁消息通道，ARGV[2] uuid:threadId
                 LockPubSub.UNLOCK_MESSAGE, getLockName(threadId));
     }
 
@@ -171,16 +177,20 @@ public class RedissonReadLock extends RedissonLock implements RLock {
         String keyPrefix = getKeyPrefix(threadId, timeoutPrefix);
         
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                // 获取重入次数
                 "local counter = redis.call('hget', KEYS[1], ARGV[2]); " +
                 "if (counter ~= false) then " +
+                    // 不为空说明正常加锁，更新锁过期时间
                     "redis.call('pexpire', KEYS[1], ARGV[1]); " +
                     
                     "if (redis.call('hlen', KEYS[1]) > 1) then " +
                         "local keys = redis.call('hkeys', KEYS[1]); " + 
                         "for n, key in ipairs(keys) do " + 
+                            // 遍历锁hash所有field，找到uuid:threadId的值，也即重入次数
                             "counter = tonumber(redis.call('hget', KEYS[1], key)); " + 
                             "if type(counter) == 'number' then " + 
                                 "for i=counter, 1, -1 do " + 
+                                    // 重置所有重入标记过期时间
                                     "redis.call('pexpire', KEYS[2] .. ':' .. key .. ':rwlock_timeout:' .. i, ARGV[1]); " + 
                                 "end; " + 
                             "end; " + 
@@ -190,7 +200,9 @@ public class RedissonReadLock extends RedissonLock implements RLock {
                     "return 1; " +
                 "end; " +
                 "return 0;",
+            // KEY[1] lock name，KEY[2] {lock name}:uuid:threadId
             Arrays.<Object>asList(getRawName(), keyPrefix),
+            // ARGV[1] 默认超时时间30秒，ARGV[2] uuid:threadId
             internalLockLeaseTime, getLockName(threadId));
     }
     
