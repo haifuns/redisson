@@ -267,12 +267,17 @@ public class RedissonSemaphore extends RedissonExpirable implements RSemaphore {
         }
 
         return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                  // 查询信号量
                   "local value = redis.call('get', KEYS[1]); " +
+                  // 如果存在，并且剩余数量大于申请的数量
                   "if (value ~= false and tonumber(value) >= tonumber(ARGV[1])) then " +
+                      // 扣减申请的数量，返回成功
                       "local val = redis.call('decrby', KEYS[1], ARGV[1]); " +
                       "return 1; " +
                   "end; " +
+                  // 否则返回失败
                   "return 0;",
+                  // KEY[1] 信号量名称，KEY[2] 信号数量
                   Collections.<Object>singletonList(getRawName()), permits);
     }
 
@@ -449,7 +454,9 @@ public class RedissonSemaphore extends RedissonExpirable implements RSemaphore {
         }
 
         RFuture<Void> future = commandExecutor.evalWriteAsync(getRawName(), StringCodec.INSTANCE, RedisCommands.EVAL_VOID,
+                // 直接给信号量加释放的个数
                 "local value = redis.call('incrby', KEYS[1], ARGV[1]); " +
+                        // 发布一条释放信号消息给等待的线程
                         "redis.call('publish', KEYS[2], value); ",
                 Arrays.asList(getRawName(), getChannelName()), permits);
         if (log.isDebugEnabled()) {

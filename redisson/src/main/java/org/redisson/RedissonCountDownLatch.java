@@ -55,6 +55,7 @@ public class RedissonCountDownLatch extends RedissonObject implements RCountDown
 
     @Override
     public void await() throws InterruptedException {
+        // 如果计数器为0直接返回
         if (getCount() == 0) {
             return;
         }
@@ -63,6 +64,7 @@ public class RedissonCountDownLatch extends RedissonObject implements RCountDown
         try {
             commandExecutor.syncSubscriptionInterrupted(future);
 
+            // 如果计数器大于0，就等待计数器为0的消息，循环判断直到计数器到0
             while (getCount() > 0) {
                 // waiting for open state
                 future.getNow().getLatch().await();
@@ -285,8 +287,11 @@ public class RedissonCountDownLatch extends RedissonObject implements RCountDown
     @Override
     public RFuture<Void> countDownAsync() {
         return commandExecutor.evalWriteNoRetryAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                        // 减少CountDownLatch计数器数量
                         "local v = redis.call('decr', KEYS[1]);" +
+                        // 如果剩余的计数器小于0就直接删除
                         "if v <= 0 then redis.call('del', KEYS[1]) end;" +
+                        // 如果剩余计数器等于0，就发布一条计数器为零的消息通知订阅的线程
                         "if v == 0 then redis.call('publish', KEYS[2], ARGV[1]) end;",
                     Arrays.<Object>asList(getRawName(), getChannelName()), CountDownLatchPubSub.ZERO_COUNT_MESSAGE);
     }
@@ -317,10 +322,14 @@ public class RedissonCountDownLatch extends RedissonObject implements RCountDown
     @Override
     public RFuture<Boolean> trySetCountAsync(long count) {
         return commandExecutor.evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
+                // 如果CountDownLatch name不存在
                 "if redis.call('exists', KEYS[1]) == 0 then "
+                    // 新增CountDownLatch
                     + "redis.call('set', KEYS[1], ARGV[2]); "
+                    // 发布一条新增计数器的消息
                     + "redis.call('publish', KEYS[2], ARGV[1]); "
                     + "return 1 "
+                // 存在直接返回失败
                 + "else "
                     + "return 0 "
                 + "end",
